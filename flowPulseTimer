@@ -1,0 +1,289 @@
+/*
+  FlowPulseTimer v0.1 - Monitor water flow, recording pulse count and time to SD, supporting calc volume per pulse
+  Sketch revision 2021-Nov-16a
+  ---------------------------------------------
+  Sketch is WIP
+
+  ---------------------------------------------
+
+  ***********************
+   Uno board
+   Digital PIN Assignments:
+   D00
+   D01
+   D02 Flow Sensor Interupt (ISR pulse count)
+   D03 Button, internal Pull-Up to 5v - Button pull signal to LOW when pressed (connect to GND)
+   D04
+   D10 Chip Select
+   D11 MOSI
+   D12 MISO
+   D13 SCK
+   D16 SDA (Ic2 bus)
+   D17 SCL (Ic2 bus)
+
+*/
+
+//***************************************
+//***** Initialisation
+//***************************************
+
+const String version = "211116a";
+
+//***** Libraries
+#include <SD.h>
+#include <SPI.h>
+#include "RTClib.h"
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+//***** Define device libraries
+RTC_DS3231 rtc;    // Configure RTC library to DS3231 RTC device
+LiquidCrystal_I2C lcd(0x27, 20, 4);     // Initialise LCD library, I2C address 0x27, 20 column and 4 rows (16x2 LCD by changing the parameters)
+
+//***** Pin assignments
+const byte flowMeterPin = 2;            // Interrupt enabled digital pin 2 for flow meter
+const byte buttonPin = 3;               // Button pin to Digital pin 3
+const byte SDchipSelectPin = 4;         // SPI de-conflicting setup of CS for Ethernet and CD card
+
+//***** Flow sensor variables
+volatile int  pulseCount = 0;           // counter for flow meter pulses per Second
+int pulseCountLast = 0;
+unsigned long flowPulseCount = 0;
+
+bool flowActive = false;
+
+//***************************************
+//***** Timing Variables and Constants
+// Boot time variables
+String bootTime = "";
+
+// Menu display controls
+unsigned long flowStartTime = 0;
+unsigned long flowStopTime = 0;
+bool updateLCD = true;
+
+
+//***************************************
+//***** Setup
+//***************************************
+void setup ( ) {
+
+  //***** Start Serial Monitor
+  Serial.begin (9600);
+
+  //***** Initialise LCD & turn on, report 'booting' from top left (char 0, row 0)
+  lcd.begin(20, 4);
+  lcd.init();
+  lcd.backlight();
+
+  //***** Initialise I2C bus
+  Wire.begin();                         // Initialise I2C bus
+  rtc.begin();                          // Initialise RTC library
+
+
+  //***** Set Pin Modes
+  pinMode(buttonPin, INPUT_PULLUP);      // Button to use digital input pin with pull-up resistor to 5v, requiring button connect to GND when pressed
+  pinMode(flowMeterPin, INPUT);
+  attachInterrupt(digitalPinToInterrupt(flowMeterPin), flow, RISING); // Setup Interrupt http://arduino.cc/en/Reference/attachInterrupt
+  interrupts();
+
+  pinMode(10, OUTPUT);               // pin 10 -> make sure that the default chip select pin for Ethernet W5100 chip is set to output (necessary!)
+  pinMode(SDchipSelectPin, OUTPUT);  // pin 4 -> make sure Ethernet Shield, CS is pin 4 is set as an output (necessary!)
+
+
+  //***** Start setup of SD
+  // Switch SD Card ON
+  digitalWrite(10, HIGH);                   	// TURN OFF the W5100 chip!
+  digitalWrite(SDchipSelectPin, LOW); 		    // turn on the SD chip!
+  //  Serial.println("Setting up SD card...");    //To use the SD card, you set its SS pin HIGH and the Ethernet shield's SS pin LOW
+  lcd.setCursor(0, 1);
+  lcd.print(F("Checking SD Card "));            // Report to LCD
+
+  if (!SD.begin(SDchipSelectPin))
+  {
+    Serial.println(F("ERROR: SD Card failed, or not present"));
+    lcd.setCursor(0, 2);
+    lcd.print(F("ERROR: No SD Card  "));       // Report to LCD
+  }
+  else
+  {
+    lcd.setCursor(0, 2);
+    lcd.print(F("SD Card OK!"));
+    delay(1000);
+  }
+
+  // End setup SD
+
+
+  //***** Record time of last boot
+  DateTime time = rtc.now();
+  bootTime = time.timestamp(DateTime::TIMESTAMP_FULL);
+  lastHour = time.hour();                               // Set current hour as 'last' to trigger water data storage on the hour
+
+
+}
+
+//***************************************
+//***************************************
+//***** Loop
+//***************************************
+//***************************************
+void loop()   // High Speed Loop (fast ops only)
+{
+  //  Serial.print(".");
+
+
+  if (pulseCountLast == pulseCount)
+  {
+    if (flowActive)
+    {
+      flowTime = millis() - flowStartTime;
+      flowActive = false;                       // tracking just ended
+      updateLCD = true;                         // trigger LCD update
+      recordDatatoSD = true;                    // trigger SD recording
+    }
+    delay(100);
+  }
+
+  if (pulseCountLast != pulseCount)
+  {
+    if (!flowActive)              // in event previous test was inactive
+    {
+      flowStartTime = millis();   // start timer
+      flowActive = true;
+      lcd.setCursor(9, 3)
+      lcd.print("MEASURING");
+    }
+    pulseCountLast = pulseCount;   // always set test conition
+    delay(250);
+  }
+
+  if (updateLCD) menuDisplay();
+
+
+
+  // Recording of data on regular intervals
+  if (checkTime >= nextLogSDTime)
+  {
+    recordWaterDataSD();
+    nextLogSDTime = checkTime + (logSDInterval * 1000);
+  }
+
+
+}
+
+
+
+//***************************************
+//***** LCD menu display
+//***************************************
+void menuDisplay()
+{
+  //***** Date and Time constants
+  char daysOfTheWeek[7][12] = {"Sun", "Mon", "Tues", "Wed", "Thr", "Fri", "Sat"};
+  String monthName[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  float disp;
+
+  //  Serial.print(displayMenu);
+
+  DateTime time = rtc.now();
+  lcd.setCursor(0, 0);
+  lcd.print(daysOfTheWeek[time.dayOfTheWeek()]);
+  lcd.print(" ");
+  lcd.print(time.day(), DEC);
+  lcd.print(" ");
+  lcd.print(monthName[time.month() - 1]);
+  lcd.print(" ");
+  lcd.print(time.timestamp(DateTime::TIMESTAMP_TIME));
+
+  lcd.setCursor(0, 1);                      // set lcd position top left corner
+  lcd.print(F("Pulses    : "));
+  lcd.print(flowPulseCount);   // pulses counted last flow
+  lcd.print("  ");
+
+  lcd.setCursor(0, 2);
+  lcd.print(F("Time (ms): "));
+  lcd.print(flowTime);               // ms of last flow
+  lcd.print("  ");
+
+  lcd.setCursor(0, 3);
+  lcd.print(F("Status : Waiting"));
+
+  updateLCD = false;
+}
+
+
+//***************************************
+//***** Interrupt Service Routine - counting flow pulses from water flow
+//***************************************
+
+void flow()                            // Interrupt function
+{
+  pulseCount++;                       // on interupt, add one to the pulse count
+}
+
+
+//***************************************
+//***** Record Water Data
+//***************************************
+
+void recordWaterData()
+{
+  newHour = false;                                               // reset trigger
+  waterLitrePerHour[lastHour - 1] = deciLitreCurrentHour / 10L;  // Record total usage to array
+  deciLitreToday += deciLitreCurrentHour;
+  deciLitreCurrentHour = 0;
+}
+
+
+//***************************************
+//***** Record Water Data to SD card
+//***************************************
+
+void recordWaterDataSD()
+{
+  DateTime time = rtc.now();
+  //  writeToSD(String(time.timestamp(DateTime::TIMESTAMP_FULL)+","+"WaterData,"),"waterData.txt");
+  String waterData = String
+                     (
+                       time.timestamp(DateTime::TIMESTAMP_FULL) + "," +
+                       //    "RTC Temp,"+String(rtc.getTemperature())+","+
+                       F("Max Flow dL/min:,") + maxDeciLitrePerMin + "," +
+                       F("Current Hr dL,") + deciLitreCurrentHour
+                     );
+  //  Serial.println(waterData);
+  writeToSD(waterData, F("Flow.txt"));
+}
+
+
+//***************************************
+//***** SubRoutine - Save data to SD Card
+//***************************************
+
+void writeToSD(String dataString, String fileName)
+{ // open the file. note that only one file can be open at a time, so you have to close this one before opening another.
+  //----- Switch OFF Ethernet & SD Card ON
+  digitalWrite(10, HIGH); 	// TURN OFF the W5100 chip!
+  digitalWrite(SDchipSelectPin, LOW); 		    // turn on the SD chip!
+  //  SDavailable = true;
+
+  File dataFile = SD.open(fileName, FILE_WRITE );
+  if (SD.begin(SDchipSelectPin))
+  { // if the file is available, write to it
+    dataFile.println(dataString);
+    dataFile.close();
+    Serial.print(F("Data written to "));
+    Serial.print(fileName);
+    Serial.println(F(" on SD card: "));
+    Serial.println(dataString);
+  }
+  else
+  {
+    Serial.print(F("ERROR: opening "));
+    Serial.println(fileName);
+  }
+}
+
+
+
+
